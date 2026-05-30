@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from typing import Any
 
 from culture.aio import maybe_await
 from culture.clients._audit import AuditWriter
@@ -524,14 +525,12 @@ class AgentDaemon:
             return False
         state["warned_state"] = new_state
         since = int(now - since_ts)
-        await self._daemon_log.record(
+        await self._notify_boss(
             "idle_warning",
+            self._stall_message(new_state, since),
             reason=new_state,
             since_seconds=since,
         )
-        boss = _boss_nick(self.agent)
-        if boss and self._transport is not None:
-            await self._transport.send_privmsg(boss, self._stall_message(new_state, since))
         return False
 
     def _maybe_rearm_watchdog(self) -> None:
@@ -707,17 +706,43 @@ class AgentDaemon:
         await self._agent_runner.send_prompt("/compact")
         await self._daemon_log.record("compact", trigger="context_watermark", pct=round(pct, 3))
 
-    async def _on_perm_request(self, payload: dict) -> None:
-        """Surface a worker permission request to its boss over IRC (best-effort).
+    async def _notify_boss(
+        self, action: str, message: str, *, also_daemon_log: bool = True, **detail: Any
+    ) -> bool:
+        """Send a structured notification to the parent boss with daemon-log
+        fallback. Returns True if the IRC DM succeeded.
 
-        Fired by this worker's PermissionBroker when a tool call routes to the
-        boss. DMs the owning boss (``self.agent.boss``) so the boss's activation
-        handler fires and it can approve/deny. If no boss is configured (the
-        human-supervised case from PR #411) we post nothing — the human finds the
-        request via ``culture boss pending`` or the Mission Control dashboard.
+        Every boss-facing alert (stall, circuit_open, perm_request, supervisor
+        escalation) routes through this helper so the daemon-log is the
+        single source of truth for "what was raised" — the dashboard can read
+        and surface it even when IRC is broken / boss is dead. The IRC DM is
+        best-effort; transport errors do not raise.
+
+        ``action`` is the daemon-log action name. ``detail`` is the daemon-log
+        detail dict, so caller can use any keys (including 'reason') without
+        colliding with this helper's signature.
         """
+        if also_daemon_log:
+            await self._daemon_log.record(action, **detail)
         boss = _boss_nick(self.agent)
         if not boss or self._transport is None:
+            return False
+        try:
+            await self._transport.send_privmsg(boss, message)
+            return True
+        except Exception:  # noqa: BLE001 — DM is advisory; daemon-log already landed
+            logger.warning("Failed to DM boss %s with %s", boss, action, exc_info=True)
+            return False
+
+    async def _on_perm_request(self, payload: dict) -> None:
+        """Surface a worker permission request to its boss.
+
+        Fired by this worker's PermissionBroker when a tool call routes to the
+        boss. DMs the owning boss (``self.agent.boss``) AND records to
+        daemon-log so the dashboard sees the request even if the DM fails.
+        """
+        boss = _boss_nick(self.agent)
+        if not boss:
             return
         tool = payload.get("tool_name", "?")
         req_id = payload.get("id", "?")
@@ -726,7 +751,12 @@ class AgentDaemon:
             f"[perm] worker {self.agent.nick} wants {tool}: {preview} "
             f"— id {req_id} (approve/deny)"
         )
-        await self._transport.send_privmsg(boss, notice)
+        await self._notify_boss(
+            "perm_request_notified",
+            notice,
+            tool=tool,
+            request_id=req_id,
+        )
 
     @staticmethod
     def _perm_input_preview(tool: str, input_dict: dict) -> str:
@@ -805,11 +835,6 @@ class AgentDaemon:
                 len(self._crash_times),
                 CRASH_WINDOW_SECONDS,
             )
-            await self._daemon_log.record(
-                "circuit_open",
-                count=len(self._crash_times),
-                window_s=CRASH_WINDOW_SECONDS,
-            )
             if self._webhook:
                 await self._webhook.fire(
                     AlertEvent(
@@ -821,25 +846,17 @@ class AgentDaemon:
                         ),
                     )
                 )
-            boss = _boss_nick(self.agent)
-            if boss and self._transport is not None:
-                try:
-                    await self._transport.send_privmsg(
-                        boss,
-                        f"[circuit_open] worker {self.agent.nick} crashed "
-                        f"{len(self._crash_times)} times in {CRASH_WINDOW_SECONDS}s "
-                        f"— circuit breaker opened, NOT restarting. Investigate "
-                        f"its audit log and decide whether to restart manually.",
-                    )
-                except (
-                    Exception
-                ):  # noqa: BLE001 — DM is advisory; daemon-log + webhook still landed
-                    logger.warning(
-                        "Failed to DM boss %s on circuit_open for %s",
-                        boss,
-                        self.agent.nick,
-                        exc_info=True,
-                    )
+            await self._notify_boss(
+                "circuit_open",
+                (
+                    f"[circuit_open] worker {self.agent.nick} crashed "
+                    f"{len(self._crash_times)} times in {CRASH_WINDOW_SECONDS}s "
+                    f"— circuit breaker opened, NOT restarting. Investigate "
+                    f"its audit log and decide whether to restart manually."
+                ),
+                count=len(self._crash_times),
+                window_s=CRASH_WINDOW_SECONDS,
+            )
             return True
         return False
 
@@ -905,7 +922,10 @@ class AgentDaemon:
             await self._socket_server.send_whisper(message, whisper_type)
 
     async def _on_supervisor_escalation(self, message: str) -> None:
-        """Escalate via webhook + IRC when supervisor exhausts whispers."""
+        """Escalate via webhook + daemon-log + IRC DM when supervisor
+        exhausts whispers. Without the boss DM the escalation is invisible
+        to the agent that's supposed to act on it (boss reads IRC, not the
+        webhook channel)."""
         if self._webhook:
             await self._webhook.fire(
                 AlertEvent(
@@ -914,6 +934,10 @@ class AgentDaemon:
                     message=f"[ESCALATION] {self.agent.nick}: {message}",
                 )
             )
+        await self._notify_boss(
+            "supervisor_escalation",
+            f"[escalation] worker {self.agent.nick}: {message}",
+        )
 
     # ------------------------------------------------------------------
     # IPC handler
@@ -959,6 +983,12 @@ class AgentDaemon:
         self._manually_paused = False
         if self._agent_runner is not None:
             self._agent_runner.set_paused(False)
+        # Supervisor sets paused=True on escalation and has no auto-reset, so
+        # without this an escalated worker stays unsupervised forever even
+        # after the operator un-pauses it. (Workflow finding: "supervisor
+        # self-pauses on first escalation and never un-pauses".)
+        if self._supervisor is not None:
+            self._supervisor.resume()
         logger.info("Agent %s resumed", self.agent.nick)
         self._log_action_bg("resume", manual=True)
         # Re-arm the watchdog: it returns when _paused is True, so resuming
