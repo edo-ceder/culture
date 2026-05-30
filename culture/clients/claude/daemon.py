@@ -41,6 +41,18 @@ CRASH_RESTART_DELAY = 5
 # engaged (wrong channel / never briefed) — flag it back to the boss.
 IDLE_GRACE_SECONDS = 90
 
+# After the worker has been activated (mention/poll/invite landed) OR has
+# already produced at least one turn, this is the maximum gap between
+# AssistantMessages before we surface a "stall" warning to the boss. Generous
+# enough to cover slow first turns, extended thinking, and long-running tool
+# calls; tight enough that a genuinely hung worker is noticed within minutes.
+STALL_GRACE_SECONDS = 300
+
+# Periodic re-check interval for the idle watchdog. Short relative to grace
+# windows so a state-change is surfaced promptly; long enough to keep wakeups
+# cheap.
+WATCHDOG_POLL_SECONDS = 30
+
 # IPC validation error messages
 _ERR_MISSING_CHANNEL = "Missing 'channel'"
 _ERR_MISSING_CHANNEL_THREAD = "Missing 'channel' or 'thread'"
@@ -141,6 +153,10 @@ class AgentDaemon:
         # the truth back to the boss instead of relying on anyone to notice.
         self._engaged: bool = False
         self._idle_task: asyncio.Task | None = None
+        # Last AssistantMessage timestamp — drives the unified stall watchdog
+        # (catches "engaged then silent" as well as "activated then silent").
+        # None until the first turn lands.
+        self._last_assistant_message_at: float | None = None
 
         # Pause/sleep state
         self._paused: bool = False
@@ -335,6 +351,7 @@ class AgentDaemon:
                 elif not should_sleep and self._paused and not self._manually_paused:
                     self._paused = False
                     logger.info("Sleep schedule: resuming %s", self.agent.nick)
+                    self._maybe_rearm_watchdog()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -437,32 +454,112 @@ class AgentDaemon:
                 self._idle_task.cancel()
             self._engaged = False
             self._last_activation = None
+            self._last_assistant_message_at = None
             self._idle_task = asyncio.create_task(self._idle_watchdog())
 
     async def _idle_watchdog(self) -> None:
-        """If a boss-owned worker is never triggered within the grace window,
-        record it and DM the boss — so an idle/mis-briefed worker surfaces itself
-        instead of the boss falsely believing it's working."""
+        """Detect three classes of silent boss-owned worker, DM the boss each.
+
+        Runs as a periodic poll (not one-shot) so a worker that engaged-then-
+        went-silent is still caught — the bug behind the original one-shot
+        watchdog that returned silently the moment ``_last_activation`` was
+        set, regardless of whether the worker ever actually produced output.
+
+        Classes (each warned at most once until state changes):
+
+        * ``never_briefed`` — alive > IDLE_GRACE_SECONDS with no mention/poll/
+          invite ever landed.
+        * ``stalled_pre_engagement`` — brief landed (_last_activation set) but
+          no AssistantMessage produced after STALL_GRACE_SECONDS. SDK hang
+          (rate-limit, extended-thinking never resolving, etc).
+        * ``stalled_post_engagement`` — already engaged but no new
+          AssistantMessage in STALL_GRACE_SECONDS. The class the old watchdog
+          could never see because _engaged=True disabled it.
+
+        On resume from pause, the watchdog is re-armed (see ``_maybe_rearm_watchdog``).
+        """
+        armed_at = time.time()
+        state: dict = {"warned_state": None}
         try:
-            await asyncio.sleep(IDLE_GRACE_SECONDS)
+            while True:
+                try:
+                    await asyncio.sleep(WATCHDOG_POLL_SECONDS)
+                except asyncio.CancelledError:
+                    return
+                if await self._watchdog_tick(armed_at, state):
+                    return
         except asyncio.CancelledError:
             return
-        if self._engaged or self._paused or self._agent_runner is None:
-            return
-        # A worker that WAS triggered (mentioned/briefed) but hasn't finished its
-        # first turn yet (slow model, extended thinking, long first tool call) is
-        # busy, not idle — only flag one that was never even activated.
-        if self._last_activation is not None:
-            return
+
+    async def _watchdog_tick(self, armed_at: float, state: dict) -> bool:
+        """One iteration of the watchdog loop. Returns True if the caller
+        should stop looping (paused / runner dead). Public for tests so the
+        watchdog can be driven deterministically without sleeping."""
+        if self._paused:
+            return True
+        if self._agent_runner is None or not self._agent_runner.is_running():
+            return True
+        now = time.time()
+        new_state: str | None = None
+        since_ts: float = now
+        if not self._engaged:
+            if self._last_activation is None:
+                if now - armed_at >= IDLE_GRACE_SECONDS:
+                    new_state = "never_briefed"
+                    since_ts = armed_at
+            else:
+                if now - self._last_activation >= STALL_GRACE_SECONDS:
+                    new_state = "stalled_pre_engagement"
+                    since_ts = self._last_activation
+        else:
+            last = self._last_assistant_message_at
+            if last is not None and now - last >= STALL_GRACE_SECONDS:
+                new_state = "stalled_post_engagement"
+                since_ts = last
+        if not new_state or new_state == state.get("warned_state"):
+            return False
+        state["warned_state"] = new_state
+        since = int(now - since_ts)
+        await self._daemon_log.record(
+            "idle_warning",
+            reason=new_state,
+            since_seconds=since,
+        )
         boss = _boss_nick(self.agent)
-        await self._daemon_log.record("idle_warning", detail={"since_seconds": IDLE_GRACE_SECONDS})
         if boss and self._transport is not None:
-            await self._transport.send_privmsg(
-                boss,
-                f"[idle] worker {self.agent.nick} has produced no activity "
-                f"{IDLE_GRACE_SECONDS}s after start — it may not be in its "
-                f"#task channel or was never briefed. Check and re-drive it.",
+            await self._transport.send_privmsg(boss, self._stall_message(new_state, since))
+        return False
+
+    def _maybe_rearm_watchdog(self) -> None:
+        """Start a fresh idle watchdog task if this is a boss-owned worker and
+        the previous task is gone (the watchdog returns when paused, so resume
+        must respawn it to keep coverage)."""
+        if not _boss_nick(self.agent):
+            return
+        if self._idle_task is not None and not self._idle_task.done():
+            return
+        if self._agent_runner is None or not self._agent_runner.is_running():
+            return
+        self._idle_task = asyncio.create_task(self._idle_watchdog())
+
+    def _stall_message(self, reason: str, since: int) -> str:
+        nick = self.agent.nick
+        if reason == "never_briefed":
+            return (
+                f"[idle] worker {nick} has produced no activity {since}s "
+                f"after start — it may not be in its #task channel or was "
+                f"never briefed. Check and re-drive it."
             )
+        if reason == "stalled_pre_engagement":
+            return (
+                f"[stall] worker {nick} received its brief {since}s ago but "
+                f"has not produced any output — the SDK call may have hung. "
+                f"Check its audit, consider re-driving or restarting."
+            )
+        return (
+            f"[stall] worker {nick} engaged but has been silent for {since}s "
+            f"(no new turns). Check its audit, consider re-driving."
+        )
 
     def _on_mention(self, target: str, sender: str, text: str) -> None:
         """Called by IRCTransport when the agent is @mentioned or DM'd.
@@ -561,6 +658,10 @@ class AgentDaemon:
             # (which reads the daemon-log, not audit size) clears authoritatively.
             self._engaged = True
             await self._daemon_log.record("engaged")
+        # Drive the stall watchdog: every AssistantMessage resets the "time
+        # since last turn" timer. A worker that engaged-then-went-silent is
+        # only catchable because we track this.
+        self._last_assistant_message_at = time.time()
         await self._audit.write(msg)
 
         if self._supervisor:
@@ -821,6 +922,9 @@ class AgentDaemon:
         self._manually_paused = False
         logger.info("Agent %s resumed", self.agent.nick)
         self._log_action_bg("resume", manual=True)
+        # Re-arm the watchdog: it returns when _paused is True, so resuming
+        # without restarting it leaves the worker un-monitored.
+        self._maybe_rearm_watchdog()
         # NOTE: Catch-up on missed messages is not yet implemented.
         # IRCTransport does not process HISTORY responses into the buffer.
         # The agent resumes and will see new messages going forward.
