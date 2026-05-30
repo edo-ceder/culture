@@ -519,12 +519,24 @@ def _cmd_spawn(args: argparse.Namespace) -> None:
         print(f"Error creating worker: {create.stderr or create.stdout}", file=sys.stderr)
         sys.exit(1)
     seed_helper_policy(worker_nick)
-    # A worker inherits its parent (boss)'s model unless one is given explicitly.
-    # An explicit --model overwrites; an inherited model only fills in (never
-    # clobbers a model the worker's culture.yaml already carries).
+    # A worker imitates its parent (boss) — both MODEL and THINKING/effort.
+    # An explicit --model overwrites; an inherited value only fills in (never
+    # clobbers what the worker's culture.yaml already carries). Inherited
+    # values come from the boss's daemon-log (its RUNTIME model+thinking),
+    # not its yaml — that way there are no hardcoded model strings anywhere
+    # in the inheritance chain.
     explicit_model = bool(args.model)
-    model = args.model or _boss_model()
-    _record_worker_boss(cwd, name, boss, model=model, overwrite_model=explicit_model)
+    inherited_model, inherited_thinking = _boss_inherits()
+    model = args.model or inherited_model
+    thinking = inherited_thinking
+    _record_worker_boss(
+        cwd,
+        name,
+        boss,
+        model=model,
+        thinking=thinking,
+        overwrite_model=explicit_model,
+    )
     subprocess.run([sys.executable, "-m", "culture", "agent", "register", cwd], check=False)
     subprocess.run([sys.executable, "-m", "culture", "agent", "start", worker_nick], check=False)
     # Boss joins the worker's task channel so it sees replies + perm DMs.
@@ -532,44 +544,62 @@ def _cmd_spawn(args: argparse.Namespace) -> None:
     print(f"spawned {worker_nick} (boss={boss}, cwd={cwd}); channel {_task_channel(name)}")
 
 
-def _boss_model() -> str:
-    """The boss's EXPLICITLY-configured model from its culture.yaml ('' if unset).
+def _boss_inherits() -> tuple[str, str]:
+    """The boss's RUNTIME (model, thinking), read from its daemon-log.
 
-    Read raw, not via ``agent.model`` — the runtime AgentConfig.model carries a
-    hardcoded dataclass default, so reading it would make a worker "inherit" that
-    default even when the boss never set a model (illusory inheritance). Reading
-    the boss's culture.yaml directly returns a model only when the boss truly has
-    one set.
+    The daemon-log's last ``agent_start`` record captures what the boss is
+    currently running with — that's the only honest source of truth for
+    "what the parent looks like right now." A worker spawned from this boss
+    inherits these values verbatim, so the worker imitates the boss exactly
+    with no hardcoded model strings in code or yaml anywhere along the way.
+
+    When the daemon-log is unreadable or has no agent_start (boss never
+    started), returns ``("", "")`` — caller writes empty fields and lets the
+    SDK pick the current Claude at the worker's startup.
     """
-    import yaml
-
-    server_yaml = os.path.join(culture_home(), "server.yaml")
-    try:
-        config = load_config_or_default(server_yaml, fallback=server_yaml)
-    except Exception:  # noqa: BLE001 — unreadable manifest → no inherited model
-        return ""
     boss = _boss_nick()
-    for agent in config.agents:
-        if agent.nick == boss:
-            directory = getattr(agent, "directory", "") or "."
-            try:
-                with open(os.path.join(directory, "culture.yaml"), encoding="utf-8") as handle:
-                    raw = yaml.safe_load(handle) or {}
-            except (OSError, yaml.YAMLError):
-                return ""
-            model = raw.get("model", "") if isinstance(raw, dict) else ""
-            return model if isinstance(model, str) else ""
-    return ""
+    log_path = daemon_log_path_for(boss)
+    if not os.path.exists(log_path):
+        return ("", "")
+    try:
+        with open(log_path, encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return ("", "")
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if rec.get("action") == "agent_start":
+            detail = rec.get("detail") or {}
+            model = detail.get("model") or ""
+            thinking = detail.get("thinking") or ""
+            return (
+                model if isinstance(model, str) else "",
+                thinking if isinstance(thinking, str) else "",
+            )
+    return ("", "")
+
+
+# Back-compat alias — old name returned just the model string.
+def _boss_model() -> str:
+    return _boss_inherits()[0]
 
 
 def _record_worker_boss(
-    cwd: str, suffix: str, boss: str, model: str = "", overwrite_model: bool = False
+    cwd: str,
+    suffix: str,
+    boss: str,
+    model: str = "",
+    thinking: str = "",
+    overwrite_model: bool = False,
 ) -> None:
-    """Write boss/suffix/channels (and model, if given) into the worker's culture.yaml.
+    """Write boss/suffix/channels (and model+thinking, if given) into the worker's culture.yaml.
 
     An explicit model (``overwrite_model=True``, i.e. ``--model``) is always
-    written; an inherited model only fills in when the worker has none, so a
-    re-spawn never clobbers a model the operator hand-set on the worker.
+    written; an inherited model OR thinking only fills in when the worker has
+    none, so a re-spawn never clobbers what the operator hand-set on the worker.
     """
     import yaml
 
@@ -597,7 +627,7 @@ def _record_worker_boss(
             data["agents"].append(entry)
         target = entry
         # Drop any stray top-level single-agent fields a prior buggy write left.
-        for stray in ("suffix", "boss", "channels", "model"):
+        for stray in ("suffix", "boss", "channels", "model", "thinking"):
             data.pop(stray, None)
     else:
         data.setdefault("suffix", suffix)
@@ -608,6 +638,8 @@ def _record_worker_boss(
     target["channels"] = ["#team", _task_channel(suffix)]
     if model and (overwrite_model or "model" not in target):
         target["model"] = model
+    if thinking and "thinking" not in target:
+        target["thinking"] = thinking
     with open(path, "w", encoding="utf-8") as handle:
         yaml.safe_dump(data, handle, sort_keys=False)
 

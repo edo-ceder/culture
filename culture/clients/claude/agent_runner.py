@@ -162,24 +162,21 @@ class AgentRunner:
     # ------------------------------------------------------------------
 
     def _make_options(self) -> ClaudeAgentOptions:
-        opts = ClaudeAgentOptions(
-            model=self.model,
-            cwd=self.directory,
-            permission_mode="bypassPermissions",
-            # Inherit user-level skills, MCP servers, plugins from
-            # ~/.claude/ when present.  Project + local still apply.
-            setting_sources=["user", "project", "local"],
-            # Conditional: only set when this helper has a perm-policy file.
-            # Setting it unconditionally would hang non-supervised agents
-            # (no boss watching the queue) forever on first non-auto-allow
-            # tool call.
-            can_use_tool=self._can_use_tool,
-            # Expose the agent's own nick to its Bash tools so the IRC skill
-            # (`culture channel …`) and the boss skill (`culture boss …`) can
-            # resolve this daemon's socket. Without it an autonomous daemon
-            # agent cannot address its own IRC connection.
-            env=self._subprocess_env(),
-        )
+        # Only pass `model` to the SDK when explicitly set. An empty model means
+        # "let the SDK pick the current Claude" — that's the inheritance chain
+        # the boss/worker stack relies on (no hardcoded model strings in code
+        # or yaml; new Claude versions are inherited automatically via the SDK's
+        # own default tracking).
+        opts_kwargs: dict[str, Any] = {
+            "cwd": self.directory,
+            "permission_mode": "bypassPermissions",
+            "setting_sources": ["user", "project", "local"],
+            "can_use_tool": self._can_use_tool,
+            "env": self._subprocess_env(),
+        }
+        if self.model:
+            opts_kwargs["model"] = self.model
+        opts = ClaudeAgentOptions(**opts_kwargs)
         if self.system_prompt:
             opts.system_prompt = self.system_prompt
         if self._session_id:

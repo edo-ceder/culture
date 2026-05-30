@@ -422,7 +422,10 @@ class AgentDaemon:
         await self._agent_runner.start()
         logger.info("AgentRunner started via SDK for %s", self.agent.nick)
         await self._daemon_log.record(
-            "agent_start", model=self.agent.model, directory=self.agent.directory
+            "agent_start",
+            model=self.agent.model,
+            thinking=self.agent.thinking,
+            directory=self.agent.directory,
         )
         # Arm the idle watchdog for boss-owned workers (the ones a boss expects to
         # be working). It fires once if the worker is never even triggered within
