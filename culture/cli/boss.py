@@ -230,29 +230,36 @@ def _owner_map() -> dict[str, str]:
 
 
 def _foreign_worker(worker_nick: str, boss: str, owners: dict[str, str] | None = None) -> bool:
-    """True iff ``worker_nick`` is explicitly owned by a boss other than ``boss``.
+    """True iff ``worker_nick`` is NOT owned by ``boss`` (per the manifest).
 
-    A worker with no recorded owner (legacy/standalone, or an unreadable
-    manifest) is NOT foreign — it stays visible so single-boss setups and
-    orphaned requests aren't hidden. Only a worker owned by a *different* boss is
-    filtered out, which isolates one team's queue from another's.
+    Ownership is derived from the manifest (``server.yaml`` + each worker's
+    ``culture.yaml`` ``boss`` field), which is written by ``culture boss spawn``
+    and is not worker-writable at runtime. A worker absent from the manifest is
+    foreign to every boss — fail closed — because we cannot authoritatively
+    attribute it. Use ``culture boss adopt <name>`` (planned) to claim an
+    orphan deliberately.
     """
     owner = (owners if owners is not None else _owner_map()).get(worker_nick, "")
-    return bool(owner) and owner != boss
+    return owner != boss
 
 
 def _request_is_foreign(req: dict, boss: str) -> bool:
-    """True iff a request belongs to another boss's worker.
+    """True iff a request belongs to another boss's worker, OR no boss at all.
 
-    Prefer the owner recorded IN the request payload (written by the broker at
-    request time) — it is self-contained and survives a missing/corrupt/suffix-
-    mismatched worker culture.yaml, so team isolation does not fail open. Fall
-    back to the manifest only for legacy requests that predate the recorded field.
+    SECURITY: ownership is derived from the MANIFEST, NOT from ``req['boss']``.
+    The request payload is worker-written — a buggy or malicious worker could
+    forge ``boss: <other-boss>`` to route its tool requests to a different
+    team's approver (escalation by spoofing). The manifest is spawn-recorded
+    and not worker-writable, so it's the only safe source.
+
+    A request whose ``helper_nick`` has no manifest entry is foreign to every
+    boss (fail closed). Adopt orphans explicitly rather than approving them
+    silently.
     """
-    owner = req.get("boss") or ""
-    if owner:
-        return owner != boss
-    return _foreign_worker(req.get("helper_nick", ""), boss)
+    helper_nick = req.get("helper_nick", "")
+    if not helper_nick:
+        return True
+    return _foreign_worker(helper_nick, boss)
 
 
 def _boss_irc(msg_type: str, **kwargs) -> dict | None:
@@ -378,7 +385,16 @@ def _cmd_deny(args: argparse.Namespace) -> None:
 
 
 def _cmd_audit(args: argparse.Namespace) -> None:
-    nick = f"{_server_of(_boss_nick())}-{_require_worker_suffix(args.name)}"
+    boss = _boss_nick()
+    nick = f"{_server_of(boss)}-{_require_worker_suffix(args.name)}"
+    # Team isolation: a boss may only read its own workers' audit log. Same
+    # gate as approve/deny/brief/close.
+    if _foreign_worker(nick, boss):
+        print(
+            f"REFUSED: {nick} is not your worker (owned by another boss).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     rows = _tail_jsonl(audit_path_for(nick), args.limit)
     if not rows:
         print(f"No audit entries for {nick}")
@@ -391,7 +407,15 @@ def _cmd_audit(args: argparse.Namespace) -> None:
 
 
 def _cmd_log(args: argparse.Namespace) -> None:
-    nick = f"{_server_of(_boss_nick())}-{_require_worker_suffix(args.name)}"
+    boss = _boss_nick()
+    nick = f"{_server_of(boss)}-{_require_worker_suffix(args.name)}"
+    # Team isolation: a boss may only read its own workers' daemon-log.
+    if _foreign_worker(nick, boss):
+        print(
+            f"REFUSED: {nick} is not your worker (owned by another boss).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
     rows = _tail_jsonl(daemon_log_path_for(nick), args.limit)
     if not rows:
         print(f"No daemon-log entries for {nick}")

@@ -783,6 +783,15 @@ class AgentDaemon:
         """Open the circuit breaker if crash count reached the threshold.
 
         Returns True if the circuit was opened (caller should stop restart logic).
+
+        On open, the boss is notified via THREE channels so the message lands
+        even when one is broken:
+        1. daemon-log (local FS, always succeeds — the dashboard reads this)
+        2. webhook (for ops dashboards / Slack — fires if configured)
+        3. direct DM to the parent boss over IRC (the boss may not monitor the
+           webhook channel; an in-team DM is the channel a boss agent actually
+           reads). Without this, audit1's finding #4 stands: an open circuit
+           is invisible to the boss until someone manually queries status.
         """
         if len(self._crash_times) >= MAX_CRASH_COUNT:
             self._circuit_open = True
@@ -808,6 +817,25 @@ class AgentDaemon:
                         ),
                     )
                 )
+            boss = _boss_nick(self.agent)
+            if boss and self._transport is not None:
+                try:
+                    await self._transport.send_privmsg(
+                        boss,
+                        f"[circuit_open] worker {self.agent.nick} crashed "
+                        f"{len(self._crash_times)} times in {CRASH_WINDOW_SECONDS}s "
+                        f"— circuit breaker opened, NOT restarting. Investigate "
+                        f"its audit log and decide whether to restart manually.",
+                    )
+                except (
+                    Exception
+                ):  # noqa: BLE001 — DM is advisory; daemon-log + webhook still landed
+                    logger.warning(
+                        "Failed to DM boss %s on circuit_open for %s",
+                        boss,
+                        self.agent.nick,
+                        exc_info=True,
+                    )
             return True
         return False
 
