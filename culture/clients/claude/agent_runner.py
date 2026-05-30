@@ -103,6 +103,11 @@ class AgentRunner:
         self._task: asyncio.Task | None = None
         self._stopping = False
         self._prompt_queue: asyncio.Queue[str] = asyncio.Queue()
+        # Pause gate: set means "may process the next turn"; clear means
+        # "paused, block before _process_turn". Defaults to set so a freshly
+        # started runner is not paused.
+        self._unpaused: asyncio.Event = asyncio.Event()
+        self._unpaused.set()
 
         # Permission broker — wired only when a perm-policy/<nick>.yaml exists.
         # Standalone mesh agents (no policy file) keep today's bypassPermissions
@@ -120,12 +125,33 @@ class AgentRunner:
     # Public interface
     # ------------------------------------------------------------------
 
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume turn processing inside _run_loop.
+
+        When paused, the loop blocks AFTER ``_prompt_queue.get()`` and BEFORE
+        calling _process_turn — handoff/compact/poll prompts already queued
+        sit there until resume, instead of executing while the operator
+        believes the worker is halted. Mirrors AgentDaemon._paused so the
+        pause is authoritative end-to-end.
+        """
+        if paused:
+            self._unpaused.clear()
+        else:
+            self._unpaused.set()
+
     async def start(self, initial_prompt: str = "") -> None:
         """Start the SDK session loop as a background task."""
         self._stopping = False
         if initial_prompt:
             self._prompt_queue.put_nowait(initial_prompt)
         self._task = asyncio.create_task(self._run_loop())
+        # Catch the silent-task-death case: if _run_loop ends with an unhandled
+        # exception (e.g. one escaping from a callback like on_message /
+        # on_usage that lives outside _process_turn's try-except), is_running()
+        # returns False but on_exit was never called and the daemon has no
+        # signal to restart. The done_callback fires a fallback on_exit(1) so
+        # crash recovery still kicks in.
+        self._task.add_done_callback(self._on_task_done)
 
     async def stop(self) -> None:
         """Signal the session loop to exit gracefully.
@@ -273,6 +299,13 @@ class AgentRunner:
                     break
                 if not prompt:
                     continue
+                # Honor pause AFTER consuming the prompt — already-queued
+                # handoff/compact/poll work waits until resume. Without this
+                # gate, _paused at the daemon was a half-pause: new mentions
+                # were blocked but in-flight queue items still ran.
+                await self._unpaused.wait()
+                if self._stopping:
+                    break
                 if not await self._process_turn(prompt):
                     return
 
@@ -281,6 +314,41 @@ class AgentRunner:
 
         if self.on_exit:
             await self.on_exit(0)
+
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        """Fallback exit signal when _run_loop dies with an unhandled exception.
+
+        _process_turn catches its own exceptions and calls on_exit(1) inline,
+        so the normal error path is already covered. This guards the
+        out-of-band case where an exception escapes _run_loop entirely (e.g.
+        from a callback that runs outside the inner try/except, or a bug in
+        the queue-get path), leaving the task dead with no on_exit signal.
+        """
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return  # clean exit; on_exit(0) was already called
+        logger.error("AgentRunner._run_loop terminated with unhandled exception", exc_info=exc)
+        if self._stopping or self.on_exit is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # event loop is gone — nothing we can do
+        loop.create_task(self._fallback_on_exit())
+
+    async def _fallback_on_exit(self) -> None:
+        """Best-effort on_exit(1) call when the run loop died unexpectedly."""
+        if self.on_exit is None:
+            return
+        try:
+            await self.on_exit(1)
+        except Exception:  # noqa: BLE001 — fallback is best-effort
+            logger.exception("Fallback on_exit raised; crash recovery may not run")
 
     @staticmethod
     def _assistant_to_dict(message: AssistantMessage) -> dict[str, Any]:

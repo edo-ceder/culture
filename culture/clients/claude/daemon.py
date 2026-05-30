@@ -347,9 +347,13 @@ class AgentDaemon:
 
                 if should_sleep and not self._paused:
                     self._paused = True
+                    if self._agent_runner is not None:
+                        self._agent_runner.set_paused(True)
                     logger.info("Sleep schedule: pausing %s", self.agent.nick)
                 elif not should_sleep and self._paused and not self._manually_paused:
                     self._paused = False
+                    if self._agent_runner is not None:
+                        self._agent_runner.set_paused(False)
                     logger.info("Sleep schedule: resuming %s", self.agent.nick)
                     self._maybe_rearm_watchdog()
             except asyncio.CancelledError:
@@ -941,6 +945,11 @@ class AgentDaemon:
     def _ipc_pause(self, req_id: str, msg: dict) -> dict:
         self._paused = True
         self._manually_paused = True
+        # Make pause authoritative at the SDK runner too — a half-pause that
+        # only gates mention/poll surfaces still lets queued handoff/compact
+        # work run, so the operator's halt is not actually a halt.
+        if self._agent_runner is not None:
+            self._agent_runner.set_paused(True)
         logger.info("Agent %s paused (manual)", self.agent.nick)
         self._log_action_bg("pause", manual=True)
         return make_response(req_id, ok=True)
@@ -948,6 +957,8 @@ class AgentDaemon:
     def _ipc_resume(self, req_id: str, msg: dict) -> dict:
         self._paused = False
         self._manually_paused = False
+        if self._agent_runner is not None:
+            self._agent_runner.set_paused(False)
         logger.info("Agent %s resumed", self.agent.nick)
         self._log_action_bg("resume", manual=True)
         # Re-arm the watchdog: it returns when _paused is True, so resuming
