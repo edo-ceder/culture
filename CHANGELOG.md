@@ -4,6 +4,76 @@ All notable changes to this project will be documented in this file.
 
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [9.1.3] - 2026-06-04
+
+### Added — dashboard live bridge presence
+
+Bridges (the transport-only daemons that hold a CC session's IRC
+seat under the v9.0.0-rc.1 architecture) are intentionally ad-hoc
+per CC session: ``culture bridge start`` synthesizes an AgentConfig
+at spawn time and writes a PID file but never touches
+``~/.culture/server.yaml``. Pre-9.1.3 the dashboard's
+``list_agents`` / ``list_agents_tree`` walked the manifest only, so
+a live bridge was provably reachable on the IRCd (WHOIS works) but
+invisible in Mission Control's Tree / Agents tabs.
+
+This version merges live bridge presence — sourced from the local
+``~/.culture/run/bridge-*.pid`` files — into both endpoints (and
+the SSE streams that wrap them). The merge:
+
+- **Discovery channel: filesystem only.** No IRC scrape. The earlier
+  blueprint considered a ``LIST + WHO`` scrape; the
+  discover/synthesize/critique workflow before implementation
+  surfaced five blockers (async/sync mismatch in SSE,
+  ``WHO`` protocol misreadings, channel-membership leak via
+  unrestricted WHO, observer-loopback privilege escalation, lock
+  contention with the PersistentObserver) so the IRC-scrape angle
+  is deferred. PID-file scan delivers the user-visible value
+  (bridges show up) with none of those sharp edges.
+
+- **Liveness ladder shared with the CLI.** Extracted
+  ``culture.cli.bridge.iter_bridge_pids()`` — same classification
+  ``culture bridge status`` uses (``running`` / ``stale`` / ``reused``
+  / ``broken``) — so the dashboard and the CLI cannot drift.
+
+- **Manifest wins on collision.** A nick that exists in both the
+  manifest and a live PID file produces ONE row whose identity is
+  manifest-owned; the bridge enrichment fields
+  (``bridge_status``, ``bridge_pid``, ``live_source="both"``) are
+  added but state / role / channels stay manifest-driven.
+
+- **Honest state mapping.** Only ``bridge_status="running"`` maps
+  to ``state="running"`` for synthesized rows; ``stale`` / ``reused``
+  / ``broken`` map to ``state="stopped"`` so the dashboard's
+  state-badge UI tells the truth. The precise classification is
+  surfaced in ``bridge_status``.
+
+- **AD-2 alignment.** Every bridge has ``is_boss=True`` —
+  every CC session IS a boss per the rearch plan — so bridges
+  appear as project rows automatically without any tree-builder
+  change.
+
+- **Env-var kill switch (default ON).**
+  ``CULTURE_DASHBOARD_LIVE_PRESENCE=0`` reverts to pre-9.1.3
+  manifest-only behavior instantly (no process restart).
+
+- **Defense in depth.** ``iter_bridge_pids`` filters out malformed
+  nicks (``<server>-<agent>`` rule) before they reach the UI and
+  caps the scan at 1024 entries (with a single WARNING log on
+  overflow).
+
+- **Test isolation.** ``_live_bridge_presence`` honors
+  ``CULTURE_HOME`` so existing dashboard tests that set it to a
+  tmp dir never see the dev box's real ``~/.culture/run/``. New
+  tests in ``tests/dashboard/test_live_presence.py`` cover all six
+  scenarios the adversarial critique panel flagged (collision,
+  stale, broken, kill switch, cache isolation, tree integration).
+
+Operator-visible behavior change: bridges that previously appeared
+nowhere on the dashboard now show up under their
+``project_nick`` in Mission Control's TREE and AGENTS tabs. Per-row
+behavior is otherwise unchanged.
+
 ## [9.1.2] - 2026-06-04
 
 ### Fixed — mesh-onboarding collisions

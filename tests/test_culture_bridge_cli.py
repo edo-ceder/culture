@@ -433,13 +433,17 @@ class TestCmdStatus:
         """Status enumerates every PID file with one of four labels:
         running / stale / broken / reused (Qodo PR #51 #3)."""
         os.makedirs(bridge._run_dir(), exist_ok=True)
-        with open(bridge._pid_path("alpha"), "w") as fh:
+        # Nicks use canonical ``<server>-<agent>`` shape (Rule 428343 /
+        # v9.1.2). ``iter_bridge_pids`` filters out malformed nicks as
+        # defense-in-depth, so test fixtures must mirror what the bridge
+        # CLI's ``_cmd_start`` actually writes.
+        with open(bridge._pid_path("local-alpha"), "w") as fh:
             fh.write("100")
-        with open(bridge._pid_path("beta"), "w") as fh:
+        with open(bridge._pid_path("local-beta"), "w") as fh:
             fh.write("200")
-        with open(bridge._pid_path("gamma"), "w") as fh:
+        with open(bridge._pid_path("local-gamma"), "w") as fh:
             fh.write("not-a-number")
-        with open(bridge._pid_path("delta"), "w") as fh:
+        with open(bridge._pid_path("local-delta"), "w") as fh:
             fh.write("400")
 
         # alpha=running (alive + culture), beta=stale (dead),
@@ -455,10 +459,10 @@ class TestCmdStatus:
 
         bridge._cmd_status(argparse.Namespace())
         out = capsys.readouterr().out
-        assert "alpha" in out and "running" in out and "100" in out
-        assert "beta" in out and "stale" in out and "200" in out
-        assert "gamma" in out and "broken" in out
-        assert "delta" in out and "reused" in out and "400" in out
+        assert "local-alpha" in out and "running" in out and "100" in out
+        assert "local-beta" in out and "stale" in out and "200" in out
+        assert "local-gamma" in out and "broken" in out
+        assert "local-delta" in out and "reused" in out and "400" in out
 
 
 # ----------------------------------------------------------------------

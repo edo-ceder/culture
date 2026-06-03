@@ -347,29 +347,95 @@ def _cmd_stop(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
-def _cmd_status(_args: argparse.Namespace) -> None:
-    run_dir = Path(os.path.expanduser("~/.culture/run"))
+# Soft cap on bridge-*.pid entries we'll scan in one pass. Operators that
+# have crashed thousands of bridges might still have stale PID files
+# accumulated under ``~/.culture/run/``; we don't want a runaway scan when
+# the dashboard polls this. 1024 is well above any plausible real fleet
+# size and well above 256 (an earlier proposal); the helper logs a
+# WARNING and truncates if exceeded so a dashboard user can still see
+# something rather than nothing.
+_MAX_BRIDGE_PID_SCAN = 1024
+
+
+def iter_bridge_pids(run_dir: str | Path | None = None) -> list[tuple[str, str, int]]:
+    """Scan ``~/.culture/run/`` for ``bridge-<nick>.pid`` files and
+    classify each one with the same liveness ladder ``culture bridge
+    status`` uses.
+
+    Returns a list of ``(nick, status, pid)`` tuples sorted by nick:
+
+    - ``status == "running"``: PID is alive AND ``is_culture_process``
+      OK (Linux: walks ``/proc/<pid>/cmdline``; macOS: best-effort).
+    - ``status == "stale"``: PID is not alive (file points at a dead
+      process).
+    - ``status == "reused"``: PID is alive but is NOT a culture
+      process — the OS recycled the PID for an unrelated process.
+    - ``status == "broken"``: PID file unreadable / malformed. ``pid``
+      is ``0`` in this case.
+
+    Extracted from ``_cmd_status`` so the dashboard and any other
+    consumer (e.g. a future ``culture status`` rollup) can share the
+    classification rather than each maintaining its own copy.
+
+    Args:
+        run_dir: override for ``~/.culture/run/`` — tests set this to
+            a tmp dir; passing ``None`` (the default) resolves via
+            ``os.path.expanduser``.
+
+    The scan ignores files that don't match ``bridge-<nick>.pid`` and
+    silently filters nicks that fail the canonical ``<server>-<agent>``
+    format check (Rule 428343) — a file with a malformed name should
+    not surface as a row at all. The cap at ``_MAX_BRIDGE_PID_SCAN``
+    truncates with a single WARNING log when exceeded; the operator
+    can still see the first 1024 bridges sorted alphabetically.
+    """
+    if run_dir is None:
+        run_dir = Path(os.path.expanduser("~/.culture/run"))
+    else:
+        run_dir = Path(run_dir)
+
     if not run_dir.is_dir():
-        print("no bridges running")
-        return
+        return []
+
+    # Filter+sort by name BEFORE stat()-ing so we don't waste syscalls on
+    # unrelated files. Truncate to the cap with a single log line.
+    candidates = sorted(
+        e for e in run_dir.iterdir() if e.name.startswith("bridge-") and e.name.endswith(".pid")
+    )
+    if len(candidates) > _MAX_BRIDGE_PID_SCAN:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "bridge PID scan truncated: %d files present, capping at %d. "
+            "Run `culture bridge status` to triage; stale entries can be removed by hand.",
+            len(candidates),
+            _MAX_BRIDGE_PID_SCAN,
+        )
+        candidates = candidates[:_MAX_BRIDGE_PID_SCAN]
 
     rows: list[tuple[str, str, int]] = []
-    for entry in sorted(run_dir.iterdir()):
-        if not entry.name.startswith("bridge-") or not entry.name.endswith(".pid"):
-            continue
+    for entry in candidates:
         nick = entry.name[len("bridge-") : -len(".pid")]
+        # Defense-in-depth: the bridge CLI validates nicks at start-time
+        # (see ``_validate_nick``), but operator-created or
+        # post-rollback files could violate the format. Skip rather than
+        # surface a malformed identity to the dashboard.
+        if not _valid_nick(nick):
+            continue
         pid = _read_pid(str(entry))
         if pid is None:
             rows.append((nick, "broken", 0))
         elif not is_process_alive(pid):
             rows.append((nick, "stale", pid))
         elif not is_culture_process(pid):
-            # Alive but the PID has been recycled to something else;
-            # surface separately so the operator notices.
             rows.append((nick, "reused", pid))
         else:
             rows.append((nick, "running", pid))
+    return rows
 
+
+def _cmd_status(_args: argparse.Namespace) -> None:
+    rows = iter_bridge_pids()
     if not rows:
         print("no bridges running")
         return
