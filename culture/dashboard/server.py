@@ -323,35 +323,206 @@ def _last_brief_preview(nick, config_path, max_chars=80):
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Live bridge presence (v9.1.3) — surface CC-IS-the-boss bridges in the
+# dashboard even though they have no manifest entry.
+# ---------------------------------------------------------------------------
+#
+# Bridges are intentionally ad-hoc per CC session: ``culture bridge start``
+# synthesizes an AgentConfig at spawn time and writes a PID file but never
+# touches ``~/.culture/server.yaml``. Pre-v9.1.3 the dashboard's
+# ``list_agents`` / ``list_agents_tree`` walked the manifest only, so a live
+# bridge was provably reachable on the IRCd (WHOIS works) but invisible in
+# Mission Control.
+#
+# Design decision (per the discovery + adversarial-blueprint-critique
+# workflow before this implementation): use the local **filesystem** as the
+# discovery channel — same ``~/.culture/run/bridge-<nick>.pid`` files
+# ``culture bridge status`` already reads. The earlier blueprint proposed
+# scraping the IRCd via LIST + WHO; the critique panel surfaced five
+# blockers in that path (async/sync mismatch, WHO protocol misreadings,
+# privileged-observer escalation, channel-membership leak, lock contention)
+# so the IRC-scrape angle is deferred. PID-file scan delivers the
+# user-visible value (bridges show up) with none of those sharp edges.
+#
+# Failure-mode coverage retained from the blueprint:
+# - Cap the scan at 1024 entries (logs a WARNING beyond that).
+# - Validate each derived nick with ``<server>-<agent>`` shape before it
+#   reaches the UI (defense-in-depth against operator-written PID files).
+# - Cache result for ``_LIVE_PRESENCE_TTL_SECONDS`` so the SSE 100ms
+#   poll doesn't hammer the disk + ``is_culture_process`` syscall.
+# - Manifest wins on nick collision: a manifest-registered nick gets
+#   ``bridge_status`` enriched but the row identity stays manifest-owned.
+# - Env-var rollback ``CULTURE_DASHBOARD_LIVE_PRESENCE=0`` disables the
+#   merge instantly — handlers return today's manifest-only view.
+
+_LIVE_PRESENCE_TTL_SECONDS = 1.0
+# Cache is keyed by the resolved run-dir path so a test that switches
+# ``CULTURE_HOME`` between calls never gets back another test's data.
+# Tests that need to bust the cache explicitly can call
+# ``_live_bridge_presence.cache_clear()`` via the attribute set below.
+_LIVE_PRESENCE_CACHE: dict[str, dict] = {}
+
+
+def _live_presence_enabled() -> bool:
+    """Env-var kill switch (default ON). Operators set the var to ``0``
+    (or any falsy form) to revert to manifest-only behaviour without a
+    process restart — the next request that calls into the merge sees
+    the disabled flag and skips the FS scan."""
+    raw = os.environ.get("CULTURE_DASHBOARD_LIVE_PRESENCE", "1").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _live_bridge_presence(run_dir: str | None = None) -> dict[str, dict]:
+    """Scan ``~/.culture/run/`` for live bridges and return a
+    ``{nick: synth_row}`` map. Cached for ``_LIVE_PRESENCE_TTL_SECONDS``.
+
+    The returned synth_row mirrors the full manifest agent_row shape
+    so any frontend code that destructures fields keeps working.
+
+    Args:
+        run_dir: override for the scan root (tests set this); ``None``
+            consults the default ``~/.culture/run`` via the CLI helper.
+    """
+    if not _live_presence_enabled():
+        return {}
+    import time as _time
+
+    # Resolve the run_dir: explicit arg > CULTURE_HOME/run > ~/.culture/run.
+    # Same precedence other path-resolving helpers in the codebase use
+    # (cf. ``_perm_broker.culture_home()``).
+    if run_dir is None:
+        culture_home = os.environ.get("CULTURE_HOME", "").strip()
+        run_dir = (
+            os.path.join(culture_home, "run")
+            if culture_home
+            else os.path.expanduser("~/.culture/run")
+        )
+
+    # Cache keyed by the resolved path so tests that switch CULTURE_HOME
+    # between calls never collide; the production dashboard has a stable
+    # resolved path so the cache hits as expected.
+    now = _time.monotonic()
+    entry = _LIVE_PRESENCE_CACHE.get(run_dir)
+    if entry is not None and (now - entry["ts"]) < _LIVE_PRESENCE_TTL_SECONDS:
+        return entry["data"]
+
+    # Import locally to avoid pulling the CLI module into dashboard
+    # startup when live-presence is disabled.
+    try:
+        from culture.cli.bridge import iter_bridge_pids
+    except ImportError:  # pragma: no cover — should never happen in tree
+        return {}
+
+    try:
+        rows = iter_bridge_pids(run_dir=run_dir)
+    except OSError:
+        # Filesystem went sideways (e.g. unmounted home dir). Degrade
+        # silently to "no bridges" rather than crash the dashboard.
+        rows = []
+
+    pending = _pending_counts()
+    out: dict[str, dict] = {}
+    for nick, bridge_status, pid in rows:
+        out[nick] = _synthesize_bridge_row(nick, bridge_status, pid, pending)
+
+    _LIVE_PRESENCE_CACHE[run_dir] = {"ts": now, "data": out}
+    return out
+
+
+def _live_presence_cache_clear() -> None:
+    """Test helper: drop the entire live-presence cache."""
+    _LIVE_PRESENCE_CACHE.clear()
+
+
+def _synthesize_bridge_row(
+    nick: str, bridge_status: str, pid: int, pending: dict[str, int]
+) -> dict:
+    """Build a complete agent_row for a bridge-only nick.
+
+    Must produce every field a manifest row carries (so the frontend
+    can destructure either shape uniformly) plus two new fields:
+
+    - ``bridge_status``: one of ``running|stale|reused|broken`` — the
+      raw classification from the PID ladder. Lets the frontend
+      eventually distinguish "bridge alive" from "agent state running".
+    - ``live_source``: provenance marker (``bridge_pid`` here). A
+      future IRC-scrape path could add ``irc_scrape`` or ``both``.
+
+    Per AD-2 in the rearch plan: every CC session IS a boss, so
+    ``is_boss=True`` unconditionally for bridges. ``boss=""`` because
+    a bridge has no upstream parent.
+    """
+    # Map bridge_status onto the conventional ``state`` vocab the
+    # frontend already renders (running / paused / stopped / sleeping).
+    # ``running`` → ``running``; everything else → ``stopped`` so the
+    # state badge is honest. The precise classification is in
+    # ``bridge_status``.
+    state = "running" if bridge_status == "running" else "stopped"
+    return {
+        "nick": nick,
+        "state": state,
+        "pending": pending.get(nick, 0),
+        "last_action": "",
+        "is_boss": True,
+        "boss": "",
+        "idle": False,
+        "channels": [],
+        "last_assistant": "",
+        "last_brief": "",
+        "role": "",
+        # v9.1.3 live-presence enrichment.
+        "bridge_status": bridge_status,
+        "bridge_pid": pid,
+        "live_source": "bridge_pid",
+    }
+
+
 def list_agents(config_path: str | None = None) -> list[dict]:
     """Programmatic agent grid (no CLI-text parsing)."""
     config = load_config_or_default(_config_path_or_default(config_path))
     pending = _pending_counts()
+    live = _live_bridge_presence()
     rows = []
+    seen_nicks: set[str] = set()
     for agent in config.agents:
         if getattr(agent, "archived", False):
             continue
         nick = agent.nick
         st = _agent_state(nick)
         chs = [c for c in (getattr(agent, "channels", []) or []) if isinstance(c, str)]
-        rows.append(
-            {
-                "nick": nick,
-                "state": st,
-                "pending": pending.get(nick, 0),
-                "last_action": _last_action(nick),
-                "is_boss": "boss" in (getattr(agent, "tags", []) or []),
-                "boss": getattr(agent, "boss", "") or "",
-                "idle": _is_idle(nick, st, getattr(agent, "boss", "") or ""),
-                "channels": chs,
-                "last_assistant": _last_assistant_text(nick),
-                "last_brief": _last_brief_preview(nick, config_path),
-                # role: free-text who-does-what declaration (v8.19.4).
-                # Surfaced on every card; the channels-first view also
-                # renders it on each member chip inside a channel.
-                "role": getattr(agent, "role", "") or "",
-            }
-        )
+        row = {
+            "nick": nick,
+            "state": st,
+            "pending": pending.get(nick, 0),
+            "last_action": _last_action(nick),
+            "is_boss": "boss" in (getattr(agent, "tags", []) or []),
+            "boss": getattr(agent, "boss", "") or "",
+            "idle": _is_idle(nick, st, getattr(agent, "boss", "") or ""),
+            "channels": chs,
+            "last_assistant": _last_assistant_text(nick),
+            "last_brief": _last_brief_preview(nick, config_path),
+            # role: free-text who-does-what declaration (v8.19.4).
+            # Surfaced on every card; the channels-first view also
+            # renders it on each member chip inside a channel.
+            "role": getattr(agent, "role", "") or "",
+        }
+        # v9.1.3: enrich with bridge_status when a live bridge file
+        # backs the same nick. Manifest wins for identity — we only
+        # add the enrichment fields, never overwrite state/role/etc.
+        if nick in live:
+            row["bridge_status"] = live[nick]["bridge_status"]
+            row["bridge_pid"] = live[nick]["bridge_pid"]
+            row["live_source"] = "both"
+        rows.append(row)
+        seen_nicks.add(nick)
+
+    # Append bridge-only nicks (no manifest entry) at the end. Order is
+    # alphabetical via the underlying scan.
+    for nick, synth in live.items():
+        if nick in seen_nicks:
+            continue
+        rows.append(synth)
     return rows
 
 
